@@ -2,7 +2,7 @@
 {-# CONTENT_TYPE DAPP #-}
 {-# SCRIPT_TYPE ACCOUNT #-}
 
-let VERSION = "AGGREGATOR-1.0.7 PROD"
+let VERSION = "AGGREGATOR-1.0.9 PROD"
 let CONTRACT_TYPE = "AGGREGATOR"
 
 let usdnIdStr = "DG2xFkPdDwKUoBkzGAhQtLpSGzfXLiCYPEzeKH2Ad24p"
@@ -10,7 +10,8 @@ let usdnId = base58'DG2xFkPdDwKUoBkzGAhQtLpSGzfXLiCYPEzeKH2Ad24p'
 let limitContract = "3PFB6LJyShsCKEA1AU1U1WLbDazqyj6ZL9b"
 let tsnContract = "3PKz5jnJLohF2GjShQ7bG5H4BebdoA98zZ2"
 let lendProxyContract = "3PGxMZtMnNT9pJCvXxXV4LzKqXsjvQ9XpfR"
-let pzPoolsL2Wrapper = "3PQoBfUKHkJAeGWhooLP7WS8ovb54av9Jp2"
+let pzPoolsL2Wrapper = "3PR1Qvi9mHT35SwWEkLSqqE2L8thiPLdVWU"
+let rangePoolsL2Wrapper = "3PJ269ccXMYkKo7mbJFPAhf9PaJvjNapViT"
 let pWavesDapp = "3PNfWAt2wdUxjJJKi7gXZTt7CgeP3QWjxAe"
 
 let managers = [Address(base58'3PMcMiMEs6w56NRGacksXtFG5zS7doE9fpL'), Address(base58'3PMKAL4cd77onkYuuU35115Wov1sLMEcFsv'), Address(base58'3P9xX849YJXg7C87v82cDyDy5VhKiPJpHo8'), Address(base58'3PKHFX6W4aAr1e1b8MUTz5HmdWVUcjWhgY4')]
@@ -183,7 +184,14 @@ func swapInternal(i: Invocation, routesStr: String, minToReceive: Int, refKey: S
       }
     } else if (dAppType == "pz_ranged") then {      
       let pool = Address(dApp.fromBase58String())
-      invoke(pool,"swap",[t1Str, 0],[AttachedPayment(t0, amount0)])
+      let poolTokenIdStr = tryGetStringOther("static_poolToken_idStr", pool)
+      if (t0Str == poolTokenIdStr) then {
+        invoke(Address(rangePoolsL2Wrapper.fromBase58String()), "redeemWithOneToken", [dApp, t1Str], [AttachedPayment(t0, amount0)])
+      } else if (t1Str == poolTokenIdStr) then {
+        invoke(Address(rangePoolsL2Wrapper.fromBase58String()), "generateWithOneTokenAggr", [dApp, false], [AttachedPayment(t0, amount0)])
+      } else {
+        invoke(pool,"swap",[t1Str, 0],[AttachedPayment(t0, amount0)])
+      }
     } else if (dAppType == "wx") then {
       swapWX(t0Str, t1Str, amount0)
     } else if (dAppType == "limit") then {
