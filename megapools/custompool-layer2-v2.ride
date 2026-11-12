@@ -1,0 +1,342 @@
+{-# STDLIB_VERSION 6 #-}
+{-# CONTENT_TYPE DAPP #-}
+{-# SCRIPT_TYPE ACCOUNT #-}
+
+let VERSION = "PoolsLayer2-1.0.4"
+let CONTRACT_TYPE = "POOLS_LAYER2"
+
+let managers = [
+  Address(base58'3PMcMiMEs6w56NRGacksXtFG5zS7doE9fpL'), 
+  Address(base58'3PMKAL4cd77onkYuuU35115Wov1sLMEcFsv'), 
+  Address(base58'3P9xX849YJXg7C87v82cDyDy5VhKiPJpHo8'), 
+  Address(base58'3PKHFX6W4aAr1e1b8MUTz5HmdWVUcjWhgY4'),
+  Address(base58'3PJu3pb7BST5XV7qUiHWDKmrzAkEpDSCewa')
+]
+
+func isShutdown() = {
+  match getBoolean(Address(base58'3PEpv9hRFWEEBU22WRnLsw1bH4YGtcU728o'), "is_shutdown") {
+    case x: Boolean => x
+    case _ => false
+  }
+}
+
+func getAssetBytes(assetIdStr: String) = {
+  if (assetIdStr == "WAVES") then {unit} else {assetIdStr.fromBase58String()}
+}
+
+func getAssetString(assetId: ByteVector|Unit) = {
+  match assetId {
+    case b:ByteVector => assetId.value().toBase58String()
+    case _ => "WAVES"
+  }
+}
+
+func getTokenBalance(assetId: ByteVector|Unit) = {
+  match (assetId) {
+      case t:ByteVector => assetBalance(this, t)
+      case _ => wavesBalance(this).available
+    }
+}
+
+func getPoolWeightsSumm(mainAddress: Address) = {
+  func f(accum: Int, item: String) = {
+    accum + getIntegerValue(mainAddress, "static_" + item + "_weight")
+  }
+
+  let assetIds = getStringValue(mainAddress, "static_tokenIds").split(",")
+  FOLD<10>(assetIds, 0, f)
+}
+
+func addAssetBytesToList(accum: List[ByteVector], item: String) = { accum ++ [item.getAssetBytes()] }
+
+func whitelistEnabled() = {
+  getBoolean(this, "setup_whitelistEnabled").valueOrElse(false)
+}
+
+func poolWhitelisted(address: String) = {
+  if (!whitelistEnabled()) then {true} else {
+    let whitelistCoordinatorStr = getString(this, "setup_whitelistCoordinator").valueOrElse("")
+    let whitelistCoordinator = if (whitelistCoordinatorStr != "") then addressFromString(whitelistCoordinatorStr) else unit
+    if (whitelistCoordinator != unit) then {
+      getBoolean(whitelistCoordinator.value(), address + "_poolWhitelisted").valueOrElse(false)
+    } else {
+      false
+    }
+  }
+}
+
+@Callable(i)
+func generateIndexWithOneTokenAndStake(mainAddressStr: String) = {
+  strict _notShutdown = if (!isShutdown()) then true else throw("Contract " + CONTRACT_TYPE + " is shutdown")
+  strict _validPool = if (poolWhitelisted(mainAddressStr)) then true else throw("Pool " + mainAddressStr + " is not whitelisted")
+  let tokenId = i.payments[0].assetId
+  let baseAssetId = tokenId
+  
+  let mainAddress = Address(mainAddressStr.fromBase58String())
+
+  let assetIds = FOLD<10>(getStringValue(mainAddress, "static_tokenIds").split(","), [], addAssetBytesToList)
+  let poolWeightsSumm = getPoolWeightsSumm(mainAddress)
+  strict _validSumm = if (poolWeightsSumm == 10000) then true else throw("Invalid pool weights summ " + mainAddressStr + ", summ: " + poolWeightsSumm.toString())
+  let secondaryAssetIds = assetIds.removeByIndex(assetIds.indexOf(tokenId).value())
+  let poolIndexId = getBinaryValue(mainAddress, "global_poolToken_id")
+
+  let amount = i.payments[0].amount
+
+  func handler(accum: List[AttachedPayment], assetId: ByteVector) = {
+    let assetIdStr = assetId.getAssetString()
+    let assetWeight = getIntegerValue(mainAddress, "static_" + assetIdStr + "_weight")
+    let _amount = fraction(amount, assetWeight, poolWeightsSumm)
+    strict in = match invoke(mainAddress, "swap", [assetId.getAssetString(), 0], [AttachedPayment(baseAssetId, _amount)]) {
+          case x: Int => x
+          case _ => 0
+    }
+    accum ++ [AttachedPayment(assetId, in)]
+  }
+
+  let baseAssetWeight = getIntegerValue(mainAddress, "static_" + baseAssetId.getAssetString() + "_weight")
+  let _bamount = fraction(amount, baseAssetWeight, poolWeightsSumm)
+  strict exchangeInvokes = FOLD<9>(secondaryAssetIds, [AttachedPayment(baseAssetId, _bamount)], handler)
+  strict PIssuedAmount = match invoke(mainAddress, "generateIndex", [false], exchangeInvokes) {
+    case x: Int => x
+    case _ => 0
+  }
+  strict stakeInvoke = invoke(mainAddress, "stakeIndex", [], [AttachedPayment(poolIndexId, PIssuedAmount)])
+
+  []
+}
+
+@Callable(i)
+func unstakeIndexAndRedeemAsOneToken(indexAmount: Int, mainAddressStr: String) = {
+  strict _notShutdown = if (!isShutdown()) then true else throw("Contract " + CONTRACT_TYPE + " is shutdown")
+  strict _validPool = if (poolWhitelisted(mainAddressStr)) then true else throw("Pool " + mainAddressStr + " is not whitelisted")
+  let mainAddress = Address(mainAddressStr.fromBase58String())
+  let assetIds = FOLD<10>(getStringValue(mainAddress, "static_tokenIds").split(","), [], addAssetBytesToList)
+  let baseAssetId = getStringValue(mainAddress, "static_baseTokenId").getAssetBytes()
+  let secondaryAssetIds = assetIds.removeByIndex(assetIds.indexOf(baseAssetId).value())
+  let poolIndexId = getBinaryValue(mainAddress, "global_poolToken_id")
+
+  func foldHandler1(accum: List[Int], assetId: ByteVector) = {
+    accum ++ [getTokenBalance(assetId)]
+  }
+
+  strict balancesBefore = FOLD<10>(assetIds, [], foldHandler1)
+  strict baseAssetBefore = getTokenBalance(baseAssetId)
+  # unstake the index token to this contract, then redeem it to the underlying basket (sendToOrigin=false => underlying lands here for consolidation)
+  strict unstakeInvoke = invoke(mainAddress, "unstakeIndex", [indexAmount], [])
+  strict redeemInvoke = invoke(mainAddress, "redeemIndex", [false], [AttachedPayment(poolIndexId, indexAmount)])
+  strict balancesAfter = FOLD<10>(assetIds, [], foldHandler1)
+  strict baseAssetAfter = getTokenBalance(baseAssetId)
+
+  # swap every secondary asset's redeemed amount into the base asset; the base asset's own delta is added separately below
+  func foldHandler2(accum: Int, assetId: ByteVector) = {
+    let assetNum = assetIds.indexOf(assetId).value()
+    let amount = balancesAfter[assetNum] - balancesBefore[assetNum]
+    strict in = match invoke(mainAddress, "swap", [baseAssetId.getAssetString(), 0], [AttachedPayment(assetId, amount)]) {
+      case x: Int => x
+      case _ => 0
+    }
+    accum + in
+  }
+
+  strict eggAmount = FOLD<9>(secondaryAssetIds, 0, foldHandler2)
+  strict _check = if (eggAmount < 0 || (baseAssetAfter - baseAssetBefore) < 0) then throw("Invalid amounts") else true
+  [
+    ScriptTransfer(i.caller, eggAmount + (baseAssetAfter - baseAssetBefore), baseAssetId)
+  ]
+}
+
+# used for rex
+@Callable(i)
+func generateWithOneToken(mainAddressStr: String) = {
+  strict _notShutdown = if (!isShutdown()) then true else throw("Contract " + CONTRACT_TYPE + " is shutdown")
+  strict _validPool = if (poolWhitelisted(mainAddressStr)) then true else throw("Pool " + mainAddressStr + " is not whitelisted")
+  let baseAssetId = i.payments[0].assetId
+  
+  let mainAddress = Address(mainAddressStr.fromBase58String())
+  let assetIds = FOLD<10>(getStringValue(mainAddress, "static_tokenIds").split(","), [], addAssetBytesToList)
+  let poolWeightsSumm = getPoolWeightsSumm(mainAddress)
+  strict _validSumm = if (poolWeightsSumm == 10000) then true else throw("Invalid pool weights summ " + mainAddressStr + ", summ: " + poolWeightsSumm.toString())
+  let secondaryAssetIds = assetIds.removeByIndex(assetIds.indexOf(baseAssetId).value())
+  let poolIndexId = getBinaryValue(mainAddress, "global_poolToken_id")
+
+  let payAmount = i.payments[0].amount
+
+  func handler(accum: List[AttachedPayment], assetId: ByteVector) = {
+    let assetIdStr = assetId.getAssetString()
+    let assetWeight = getIntegerValue(mainAddress, "static_" + assetIdStr + "_weight")
+    let amount = fraction(payAmount, assetWeight, poolWeightsSumm)
+    strict in = match invoke(mainAddress, "swap", [assetId.getAssetString(), 0], [AttachedPayment(baseAssetId, amount)]) {
+          case x: Int => x
+          case _ => 0
+    }
+    accum ++ [AttachedPayment(assetId, in)]
+  }
+  
+  let returnFlag = false
+  let baseAssetWeight = getIntegerValue(mainAddress, "static_" + baseAssetId.getAssetString() + "_weight")
+  let basePayAmount = fraction(payAmount, baseAssetWeight, poolWeightsSumm)
+  strict exchangeInvokes = FOLD<9>(secondaryAssetIds, [AttachedPayment(baseAssetId, basePayAmount)], handler)
+  strict PIssuedAmount = match invoke(mainAddress, "generateIndex", [returnFlag], exchangeInvokes) {
+    case x: Int => x
+    case _ => 0
+  }
+  # strict stakeInvoke = invoke(mainAddress, "stakeIndex", [], [AttachedPayment(poolIndexId, PIssuedAmount)])
+
+  [ScriptTransfer(i.caller, PIssuedAmount, poolIndexId)]
+}
+
+# used for rex
+@Callable(i)
+func redeemWithOneToken(mainAddressStr: String, outAssetIdStr: String) = {
+  strict _notShutdown = if (!isShutdown()) then true else throw("Contract " + CONTRACT_TYPE + " is shutdown")
+  strict _validPool = if (poolWhitelisted(mainAddressStr)) then true else throw("Pool " + mainAddressStr + " is not whitelisted")
+  let mainAddress = Address(mainAddressStr.fromBase58String())
+  let assetIds = FOLD<10>(getStringValue(mainAddress, "static_tokenIds").split(","), [], addAssetBytesToList)
+  let baseAssetId = outAssetIdStr.getAssetBytes()
+  let secondaryAssetIds = assetIds.removeByIndex(assetIds.indexOf(baseAssetId).value())
+  let poolIndexId = getBinaryValue(mainAddress, "global_poolToken_id")
+
+  func foldHandler1(accum: List[Int], assetId: ByteVector) = {
+    accum ++ [getTokenBalance(assetId)]
+  }
+
+  let returnToOrigin = false
+  strict balancesBefore = FOLD<10>(assetIds, [], foldHandler1)
+  strict baseAssetBefore = getTokenBalance(baseAssetId)
+  strict unstakeInvoke = invoke(mainAddress, "redeemIndex", [returnToOrigin], [i.payments[0]])
+  strict balancesAfter = FOLD<10>(assetIds, [], foldHandler1)
+  strict baseAssetAfter = getTokenBalance(baseAssetId)
+
+  func foldHandler2(accum: Int, assetId: ByteVector) = {
+    let assetNum = assetIds.indexOf(assetId).value()
+    let amount = balancesAfter[assetNum] - balancesBefore[assetNum]
+    strict in = if (assetId == baseAssetId) then {
+      amount
+    } else {
+      match invoke(mainAddress, "swap", [baseAssetId.getAssetString(), 0], [AttachedPayment(assetId, amount)]) {
+        case x: Int => x
+        case _ => 0
+      }
+    }
+    accum + in
+  }
+
+  strict out = FOLD<10>(assetIds, 0, foldHandler2)
+  [
+    ScriptTransfer(i.caller, out, baseAssetId)
+  ]
+}
+
+@Callable(i)
+func generateIndexAndStake(mainAddressStr: String) = {
+  strict _notShutdown = if (!isShutdown()) then true else throw("Contract " + CONTRACT_TYPE + " is shutdown")
+  strict _validPool = if (poolWhitelisted(mainAddressStr)) then true else throw("Pool " + mainAddressStr + " is not whitelisted")
+  let mainAddress = Address(mainAddressStr.fromBase58String())
+  let assetIds = FOLD<10>(getStringValue(mainAddress, "static_tokenIds").split(","), [], addAssetBytesToList)
+  let baseAssetId = getStringValue(mainAddress, "static_baseTokenId").getAssetBytes()
+  let secondaryAssetIds = assetIds.removeByIndex(assetIds.indexOf(baseAssetId).value())
+  let poolIndexId = getBinaryValue(mainAddress, "global_poolToken_id")
+
+  strict PIssuedAmount = match invoke(mainAddress, "generateIndex", [true], i.payments) {
+    case x: Int => x
+    case _ => 0
+  }
+
+  strict stakeInvoke = invoke(mainAddress, "stakeIndex", [], [AttachedPayment(poolIndexId, PIssuedAmount)])
+  []
+}
+
+@Callable(i)
+func unstakeAndRedeemIndex(amount: Int, mainAddressStr: String) = {
+  strict _notShutdown = if (!isShutdown()) then true else throw("Contract " + CONTRACT_TYPE + " is shutdown")
+  strict _validPool = if (poolWhitelisted(mainAddressStr)) then true else throw("Pool " + mainAddressStr + " is not whitelisted")
+  let mainAddress = Address(mainAddressStr.fromBase58String())
+  let assetIds = FOLD<10>(getStringValue(mainAddress, "static_tokenIds").split(","), [], addAssetBytesToList)
+  let baseAssetId = getStringValue(mainAddress, "static_baseTokenId").getAssetBytes()
+  let secondaryAssetIds = assetIds.removeByIndex(assetIds.indexOf(baseAssetId).value())
+  let poolIndexId = getBinaryValue(mainAddress, "global_poolToken_id")
+  
+  strict unstakeInvoke = invoke(mainAddress, "unstakeIndex", [amount], i.payments)
+  strict redeemInvoke = invoke(mainAddress, "redeemIndex", [true], [AttachedPayment(poolIndexId, amount)])
+  []
+}
+
+@Callable(i)
+func setWhitelistCoordinator(coordinator: String) = {
+  if (managers.indexOf(i.caller) == unit) then {throw("admin only")}
+  else {
+    let address = addressFromString(coordinator)
+    if (address == unit) then {throw("invalid address")} else {
+      [
+        StringEntry("setup_whitelistCoordinator", coordinator)
+      ]
+    }
+  }
+}
+
+@Callable(i)
+func setWhitelistEnabled(val: Boolean) = {
+  if (managers.indexOf(i.caller) == unit) then {throw("admin only")}
+  else {
+    let whitelistCoordinatorStr = getString(this, "setup_whitelistCoordinator").valueOrElse("")
+    let whitelistCoordinator = if (whitelistCoordinatorStr != "") then addressFromString(whitelistCoordinatorStr) else unit
+    if (whitelistCoordinator == unit && val) then {throw("set whitelist coordinator first")} else {
+      [
+        BooleanEntry("setup_whitelistEnabled", val)
+      ]
+    }
+  }
+}
+
+@Callable(i)
+func setApproverAddress(approverAddress: String) = {
+  # Allows empty string as address to disable approver contract, but if address is set it must be correct and have multisig initialized with admins
+  strict isSelf = if (i.caller == this) then true else throw("Only self invoke")
+  let _approverAddress = addressFromString(approverAddress)
+  let approverOk = match (_approverAddress) {
+      case t:Address => true
+      case _ => false
+    }
+  strict canSetApprover = if (approverOk || approverAddress == "") then true else throw("Wrong approver address")
+  let isInited = getBoolean(_approverAddress.value(), "INITED").valueOrElse(false)
+  let hasAdmins = getString(_approverAddress.value(), "ADMINS_PBKS").valueOrElse("") != ""
+  strict isApproverContract = if (approverAddress == "" || isInited && hasAdmins) then true else throw("Address is not approver contract")
+  [StringEntry("APPROVER_ADDRESS", approverAddress)]
+}
+
+@Verifier(tx)
+func verify() = {
+  let multisigStr = getString("APPROVER_ADDRESS").valueOrElse("")
+  let multisigAddress = addressFromString(multisigStr)
+  let multisigOk = match (multisigAddress) {
+      case t:Address => true
+      case _ => false
+    }
+
+  let isInited = if (multisigOk) then getBoolean(multisigAddress.value(), "INITED").valueOrElse(false) else false
+  let hasAdmins = if (multisigOk) then getString(multisigAddress.value(), "ADMINS_PBKS").valueOrElse("") != "" else false
+  if (multisigOk && isInited && hasAdmins) then { # verify with multisig
+    match tx {
+      case ttx:SetScriptTransaction => {
+        match ttx.script {
+          case script: ByteVector =>
+            let scriptHasha = blake2b256(script).toBase58String()
+            let validFrom = getInteger(multisigAddress.value(), "script%%" + CONTRACT_TYPE + "%%" + scriptHasha + "%%validFrom").valueOrErrorMessage("validFrom not set")
+            let validTo = getInteger(multisigAddress.value(), "script%%" + CONTRACT_TYPE + "%%" + scriptHasha + "%%validTo").valueOrErrorMessage("validTo not set")
+            let notSameScript = if (this.scriptHash() == blake2b256(script)) then throw("Same script, rejecting") else true
+            let feeOk = if (ttx.fee > 12000000) then throw("Too big fee") else true
+            height >= validFrom && height <= validTo && notSameScript && feeOk
+          case _ => false  # Reject SetScript(null) explicitly
+        }
+      }
+      case otx => {
+        let taskId = "tx_" + this.toString() + "_" + toBase58String(otx.id)
+        let isApproved = getBoolean(multisigAddress.value(), this.toString() + "_" + toBase58String(otx.id) + "__approved").valueOrElse(false)
+        let approvedFrom = getInteger(multisigAddress.value(), taskId + "__approvedFrom").valueOrElse(0)
+        isApproved && height >= approvedFrom
+      }
+    } 
+  } else { # verify with default method for given contract
+    sigVerify(tx.bodyBytes, tx.proofs[0], tx.senderPublicKey)
+  }
+}

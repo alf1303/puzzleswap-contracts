@@ -2,7 +2,7 @@
 {-# CONTENT_TYPE DAPP #-}
 {-# SCRIPT_TYPE ACCOUNT #-}
 
-let VERSION = "0.1.0"
+# VERSION 0.1.0 (kept as a comment: the deployed script 3P74sfmL was compiled without this let)
 
 let allowed = [
     Address(base58'3P8kKTkEduzaXpYcNvy9Ah7UNUZfvEuWpYb'),
