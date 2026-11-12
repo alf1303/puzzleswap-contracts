@@ -2,7 +2,7 @@
 {-# CONTENT_TYPE DAPP #-}
 {-# SCRIPT_TYPE ACCOUNT #-}
 
-let VERSION = "PoolsLayer2-1.0.4"
+let VERSION = "PoolsLayer2-1.0.5"
 let CONTRACT_TYPE = "POOLS_LAYER2"
 
 let managers = [
@@ -107,6 +107,8 @@ func generateIndexWithOneTokenAndStake(mainAddressStr: String) = {
 
 @Callable(i)
 func unstakeIndexAndRedeemAsOneToken(indexAmount: Int, mainAddressStr: String) = {
+  # pools unstake from i.originCaller when called by layer2, so only the stake owner may call this directly
+  strict _direct = if (i.caller == i.originCaller) then true else throw("direct call only")
   strict _notShutdown = if (!isShutdown()) then true else throw("Contract " + CONTRACT_TYPE + " is shutdown")
   strict _validPool = if (poolWhitelisted(mainAddressStr)) then true else throw("Pool " + mainAddressStr + " is not whitelisted")
   let mainAddress = Address(mainAddressStr.fromBase58String())
@@ -248,6 +250,8 @@ func generateIndexAndStake(mainAddressStr: String) = {
 
 @Callable(i)
 func unstakeAndRedeemIndex(amount: Int, mainAddressStr: String) = {
+  # pools unstake from i.originCaller when called by layer2, so only the stake owner may call this directly
+  strict _direct = if (i.caller == i.originCaller) then true else throw("direct call only")
   strict _notShutdown = if (!isShutdown()) then true else throw("Contract " + CONTRACT_TYPE + " is shutdown")
   strict _validPool = if (poolWhitelisted(mainAddressStr)) then true else throw("Pool " + mainAddressStr + " is not whitelisted")
   let mainAddress = Address(mainAddressStr.fromBase58String())
